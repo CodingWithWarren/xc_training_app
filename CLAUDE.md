@@ -17,7 +17,7 @@ This file covers things that aren't obvious from reading the code.
 
 ## App structure
 
-- `lib/main.dart` — all UI: onboarding, the Training / Runs / Settings tabs, run detail, debug tools
+- `lib/main.dart` — all UI: onboarding, the Training / Schedule / Runs / Settings tabs, run detail, debug tools
 - `lib/sync_service.dart` — the sync engine. **No widgets or BuildContext**, because background isolates run it too; progress comes back through an `onProgress` callback and a `SyncResult`
 - `lib/background_sync.dart` — headless entrypoints + scheduling (see below)
 - `lib/auth_service.dart` — sign-in and JWT persistence
@@ -59,6 +59,30 @@ To stamp the build with its source commit (shown on the Debug page as `Build: <h
 **The shared server runs at `https://xc-server.duckdns.org`** — reachable from any network, valid TLS, no tunnels needed. Use it unless you're developing against a local server.
 
 For a *local* server: from the emulator use `http://10.0.2.2:8000`; from a physical phone either `adb reverse tcp:8000 tcp:8000` + `http://127.0.0.1:8000` (USB) or the host's LAN IP with the server bound to `0.0.0.0`. Local HTTP only works because the Android manifest allows cleartext traffic (`android:usesCleartextTraffic="true"`) and iOS has a dev-only `NSAllowsArbitraryLoads` exception in `ios/Runner/Info.plist` — both can be removed once local HTTP dev is no longer needed.
+
+## Team schedule
+
+The **Schedule tab** shows upcoming practices and meets, read from a Google Calendar **iCal feed** — `lib/schedule_service.dart`. The URL comes from `--dart-define=SCHEDULE_ICS_URL=...` (in `config/dev.json`); **empty removes the tab entirely**, so the app is fully usable without it.
+
+Because that tab comes and goes — as does Debug in release builds — **tab positions are not fixed**. Resolve them with `_indexOfTab('runs')` rather than hardcoding an index; a stale literal silently navigates to the wrong page.
+
+The tab renders one card per week, collapsing repeats *within* a week onto one row (`groupByWeek` + `compactDayLabel`): a Mon–Thu practice block is one line, not four. Grouping deliberately never merges across weeks, so a mid-season schedule change reads as a distinct week instead of folding into the one before it.
+
+Get the URL from Google Calendar → hover the calendar → **Settings and sharing** → **Integrate calendar**:
+
+- **Public address in iCal format** — requires making the calendar public.
+- **Secret address in iCal format** — works on a private calendar, but the URL *is* the credential: anyone holding it can read the calendar, and it ships inside the app binary where it's trivially extractable. Prefer the public address, or move the fetch server-side (`GET /schedule`) if the schedule is ever sensitive.
+
+Why iCal and not the Calendar API: the schedule is identical for every athlete, so per-user OAuth buys nothing and would pull in `calendar.readonly` — a **sensitive** scope in Google's classification, which gates publishing behind app verification. The cost is that **Google refreshes the published feed lazily**, so calendar edits can take hours to appear. Accepted deliberately: the coach announces changes by email/in person.
+
+Two things that aren't obvious:
+
+- **Recurring events must be expanded.** The feed stores one VEVENT plus an `RRULE` ("weekly, Mon–Fri, until Oct 31"), *not* one entry per practice. Code that just iterates the file's events shows a single practice and looks like it merely has no data — it fails silently, which is why `expandRecurrence()` carries the test coverage it does. `EXDATE` (a cancelled practice) and `RECURRENCE-ID` (a single occurrence moved) are the same trap one level down.
+- **`TZID` times are read as local wall-clock.** Resolving them properly needs a full tz database; not worth the dependency for a team whose phones share the calendar's timezone. `Z`-suffixed times convert exactly. Occurrences are rebuilt from calendar fields rather than by adding a `Duration`, so a DST change mid-season can't drift practice by an hour.
+
+Supported rules: `DAILY`, `WEEKLY` (with `BYDAY`), `MONTHLY`, `YEARLY`, each with `INTERVAL` / `COUNT` / `UNTIL`. Positional forms (`BYDAY=2TU`, "second Tuesday") deliberately fall back to a single occurrence rather than emitting wrong dates.
+
+The last good feed body is cached in `shared_preferences` so the schedule survives no connectivity; the UI labels it as a saved copy rather than passing it off as live.
 
 ## Auth
 

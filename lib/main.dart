@@ -20,6 +20,7 @@ import 'background_sync.dart'
         lastBackgroundSyncPrefsKey,
         scheduleAndroidSync,
         workManagerCallbackDispatcher;
+import 'schedule_service.dart';
 import 'sync_service.dart';
 import 'training_week.dart';
 
@@ -29,6 +30,15 @@ import 'training_week.dart';
 // disables Google Sign-In; dev-login still works.
 const String _googleServerClientId = String.fromEnvironment(
   'GOOGLE_SERVER_CLIENT_ID',
+  defaultValue: '',
+);
+
+// Google Calendar iCal feed for the team schedule (practices + meets). Set via
+// --dart-define-from-file=config/dev.json — see CLAUDE.md "Team schedule".
+// Empty hides the schedule card entirely, so the app is fully usable without
+// it.
+const String _scheduleIcsUrl = String.fromEnvironment(
+  'SCHEDULE_ICS_URL',
   defaultValue: '',
 );
 
@@ -426,6 +436,13 @@ class _HomeScreenState extends State<HomeScreen> {
   // Cached future for the Runs tab: workouts other apps wrote to Health
   // Connect, grouped into logical runs. Refreshed when the tab is opened.
   Future<List<_HcRun>>? _hcRunsFuture;
+
+  // Team schedule shown on the Training tab. Cached the same way as
+  // _hcRunsFuture so a rebuild doesn't re-fetch the feed on every setState.
+  final ScheduleService _scheduleService = ScheduleService(
+    icsUrl: _scheduleIcsUrl,
+  );
+  Future<ScheduleResult>? _scheduleFuture;
 
   // Bottom-nav page index. Release: 0 = Home, 1 = Runs. Debug builds add
   // 2 = Debug tools.
@@ -1085,41 +1102,17 @@ class _HomeScreenState extends State<HomeScreen> {
     // access, automatic-upload choice).
     if (!_onboarded) return _buildOnboarding(theme);
 
-    // The team doesn't record runs in-app, so release builds are Training +
-    // Runs (workouts other apps wrote to Health Connect) + Settings. The Debug
-    // tools tab exists only in debug builds.
-    final tabs = <({String title, IconData icon, IconData selected})>[
-      (
-        title: 'Training',
-        icon: Icons.insights_outlined,
-        selected: Icons.insights,
-      ),
-      (
-        title: 'Runs',
-        icon: Icons.directions_run_outlined,
-        selected: Icons.directions_run,
-      ),
-      (
-        title: 'Settings',
-        icon: Icons.settings_outlined,
-        selected: Icons.settings,
-      ),
-      if (kDebugMode)
-        (
-          title: 'Debug',
-          icon: Icons.bug_report_outlined,
-          selected: Icons.bug_report,
-        ),
-    ];
-    const settingsIndex = 2;
+    final tabs = _tabs;
     final index = _pageIndex.clamp(0, tabs.length - 1);
+    final settingsIndex = _indexOfTab('settings');
 
     // Build only the active page — building all of them every frame would
     // re-run the Runs loaders on every setState.
-    final Widget body = switch (index) {
-      0 => _buildTrainingPage(theme),
-      1 => _buildHcRunsPage(theme),
-      settingsIndex => _buildSettingsPage(theme),
+    final Widget body = switch (tabs[index].id) {
+      'training' => _buildTrainingPage(theme),
+      'schedule' => _buildSchedulePage(theme),
+      'runs' => _buildHcRunsPage(theme),
+      'settings' => _buildSettingsPage(theme),
       _ => _buildDebugPage(theme),
     };
 
@@ -1135,7 +1128,13 @@ class _HomeScreenState extends State<HomeScreen> {
         onDestinationSelected: (i) {
           setState(() {
             _pageIndex = i;
-            if (i == 1) _hcRunsFuture = _loadHcRuns(); // refresh on open
+            // Refresh on open, so a tab never shows a stale read.
+            switch (tabs[i].id) {
+              case 'runs':
+                _hcRunsFuture = _loadHcRuns();
+              case 'schedule':
+                _scheduleFuture = _scheduleService.load();
+            }
           });
         },
         destinations: [
@@ -1149,6 +1148,49 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
   }
+
+  // The team doesn't record runs in-app, so release builds are Training +
+  // Schedule + Runs (workouts other apps wrote to Health Connect) + Settings.
+  // Schedule is present only when a feed is configured, and Debug only in
+  // debug builds — so positions shift, and callers must resolve indices via
+  // _indexOfTab rather than hardcoding them.
+  List<({String id, String title, IconData icon, IconData selected})>
+  get _tabs => [
+    (
+      id: 'training',
+      title: 'Training',
+      icon: Icons.insights_outlined,
+      selected: Icons.insights,
+    ),
+    if (_scheduleService.isConfigured)
+      (
+        id: 'schedule',
+        title: 'Schedule',
+        icon: Icons.event_outlined,
+        selected: Icons.event,
+      ),
+    (
+      id: 'runs',
+      title: 'Runs',
+      icon: Icons.directions_run_outlined,
+      selected: Icons.directions_run,
+    ),
+    (
+      id: 'settings',
+      title: 'Settings',
+      icon: Icons.settings_outlined,
+      selected: Icons.settings,
+    ),
+    if (kDebugMode)
+      (
+        id: 'debug',
+        title: 'Debug',
+        icon: Icons.bug_report_outlined,
+        selected: Icons.bug_report,
+      ),
+  ];
+
+  int _indexOfTab(String id) => _tabs.indexWhere((t) => t.id == id);
 
   // Signed-out landing: team logo, welcome message, and sign-in — no other
   // buttons, no bottom nav.
@@ -1839,7 +1881,8 @@ class _HomeScreenState extends State<HomeScreen> {
                   Align(
                     alignment: Alignment.centerLeft,
                     child: TextButton(
-                      onPressed: () => setState(() => _pageIndex = 1),
+                      onPressed: () =>
+                          setState(() => _pageIndex = _indexOfTab('runs')),
                       child: Text('See all ${runs.length} activities'),
                     ),
                   ),
@@ -1849,6 +1892,213 @@ class _HomeScreenState extends State<HomeScreen> {
         );
       },
     );
+  }
+
+  // Schedule tab: every practice and meet in the lookahead window, one card
+  // per week, with repeats inside a week collapsed onto a single row. Only
+  // built when SCHEDULE_ICS_URL is set.
+  Widget _buildSchedulePage(ThemeData theme) {
+    return RefreshIndicator(
+      onRefresh: () async {
+        final future = _scheduleService.load();
+        setState(() => _scheduleFuture = future);
+        await future;
+      },
+      child: FutureBuilder<ScheduleResult>(
+        future: _scheduleFuture ??= _scheduleService.load(),
+        builder: (context, snap) {
+          if (snap.connectionState != ConnectionState.done) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          final result =
+              snap.data ??
+              ScheduleResult(events: const [], error: '${snap.error}');
+          final now = DateTime.now();
+          final weeks = groupByWeek(result.events);
+
+          return ListView(
+            padding: const EdgeInsets.all(16),
+            // Keep the pull-to-refresh gesture alive even when the list is
+            // too short to scroll.
+            physics: const AlwaysScrollableScrollPhysics(),
+            children: [
+              // Stale data is still useful, but say so rather than passing it
+              // off as a live read.
+              if (result.fromCache && weeks.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.cloud_off_outlined,
+                        size: 16,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          "Saved copy — couldn't reach the calendar"
+                          '${result.fetchedAt != null ? ', last updated ${_fmtScheduleDay(result.fetchedAt!, now)}' : ''}.',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              if (weeks.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Text(
+                    // An error with no cached copy is the only way to get
+                    // here with something worth explaining.
+                    result.error ??
+                        'No practices or meets scheduled in the next '
+                            '${ScheduleService.lookahead.inDays} days.',
+                    textAlign: TextAlign.center,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                )
+              else
+                for (final w in weeks) _scheduleWeekCard(theme, w, now),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _scheduleWeekCard(ThemeData theme, ScheduleWeek week, DateTime now) {
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              _fmtWeekHeader(week.weekStart, now),
+              style: theme.textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 4),
+            for (final e in week.entries) _scheduleEntryTile(theme, e),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _scheduleEntryTile(ThemeData theme, ScheduleEntry e) {
+    final detail = [
+      // An all-day event's start is midnight, which would read "12:00 AM".
+      if (e.isAllDay) 'All day' else _fmtClock(e.first),
+      if (e.location != null && e.location!.isNotEmpty) e.location!,
+    ].join('  ·  ');
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 88,
+            child: Text(
+              compactDayLabel(e.starts),
+              style: theme.textTheme.bodyMedium?.copyWith(
+                fontWeight: FontWeight.w600,
+                color: theme.colorScheme.primary,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(e.summary, style: theme.textTheme.bodyMedium),
+                Text(
+                  detail,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // "This week" / "Next week" / "Week of Aug 24". Compared in UTC so a DST
+  // boundary inside the span can't turn 7 days into 6.
+  String _fmtWeekHeader(DateTime weekStart, DateTime now) {
+    final thisMonday = DateTime.utc(
+      now.year,
+      now.month,
+      now.day - (now.weekday - 1),
+    );
+    final that = DateTime.utc(weekStart.year, weekStart.month, weekStart.day);
+    switch (that.difference(thisMonday).inDays) {
+      case 0:
+        return 'This week';
+      case 7:
+        return 'Next week';
+    }
+
+    const months = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
+    return 'Week of ${months[weekStart.month - 1]} ${weekStart.day}';
+  }
+
+  // "Today" / "Tomorrow" / "Sat Sep 12" — schedule times are already local,
+  // unlike the Health Connect timestamps _fmtRunDate handles.
+  String _fmtScheduleDay(DateTime d, DateTime now) {
+    final day = DateTime(d.year, d.month, d.day);
+    final today = DateTime(now.year, now.month, now.day);
+    final diff = day.difference(today).inDays;
+    if (diff == 0) return 'Today';
+    if (diff == 1) return 'Tomorrow';
+
+    const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    const months = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
+    return '${days[d.weekday - 1]} ${months[d.month - 1]} ${d.day}';
+  }
+
+  String _fmtClock(DateTime d) {
+    final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+    final ampm = d.hour < 12 ? 'AM' : 'PM';
+    return '$h:${d.minute.toString().padLeft(2, '0')} $ampm';
   }
 
   // One of the three big numbers on the "This week" card.
