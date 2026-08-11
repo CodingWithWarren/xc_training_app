@@ -1109,7 +1109,7 @@ class _HomeScreenState extends State<HomeScreen> {
     // Build only the active page — building all of them every frame would
     // re-run the Runs loaders on every setState.
     final Widget body = switch (tabs[index].id) {
-      'training' => _buildTrainingPage(theme),
+      'home' => _buildHomePage(theme),
       'schedule' => _buildSchedulePage(theme),
       'runs' => _buildHcRunsPage(theme),
       'settings' => _buildSettingsPage(theme),
@@ -1142,7 +1142,7 @@ class _HomeScreenState extends State<HomeScreen> {
             NavigationDestination(
               icon: Icon(t.icon),
               selectedIcon: Icon(t.selected),
-              label: t.title,
+              label: t.label,
             ),
         ],
       ),
@@ -1154,30 +1154,39 @@ class _HomeScreenState extends State<HomeScreen> {
   // Schedule is present only when a feed is configured, and Debug only in
   // debug builds — so positions shift, and callers must resolve indices via
   // _indexOfTab rather than hardcoding them.
-  List<({String id, String title, IconData icon, IconData selected})>
+  // `label` is the bottom-bar caption, `title` the app-bar heading — they
+  // differ only on Home, which is captioned briefly but titled with the full
+  // app name.
+  List<
+    ({String id, String title, String label, IconData icon, IconData selected})
+  >
   get _tabs => [
     (
-      id: 'training',
-      title: 'Training',
-      icon: Icons.insights_outlined,
-      selected: Icons.insights,
+      id: 'home',
+      title: 'Chadwick XC Training',
+      label: 'Home',
+      icon: Icons.home_outlined,
+      selected: Icons.home,
     ),
     if (_scheduleService.isConfigured)
       (
         id: 'schedule',
         title: 'Schedule',
+        label: 'Schedule',
         icon: Icons.event_outlined,
         selected: Icons.event,
       ),
     (
       id: 'runs',
       title: 'Runs',
+      label: 'Runs',
       icon: Icons.directions_run_outlined,
       selected: Icons.directions_run,
     ),
     (
       id: 'settings',
       title: 'Settings',
+      label: 'Settings',
       icon: Icons.settings_outlined,
       selected: Icons.settings,
     ),
@@ -1185,6 +1194,7 @@ class _HomeScreenState extends State<HomeScreen> {
       (
         id: 'debug',
         title: 'Debug',
+        label: 'Debug',
         icon: Icons.bug_report_outlined,
         selected: Icons.bug_report,
       ),
@@ -1764,7 +1774,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // Signed-in home: what the athlete has actually run — this week's volume,
   // the four-week trend, and the latest runs. Everything here is computed from
   // Health Connect / HealthKit on the phone, so it works offline.
-  Widget _buildTrainingPage(ThemeData theme) {
+  Widget _buildHomePage(ThemeData theme) {
     return FutureBuilder<List<_HcRun>>(
       future: _hcRunsFuture ??= _loadHcRuns(),
       builder: (context, snap) {
@@ -1831,6 +1841,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
               const SizedBox(height: 12),
+              if (_scheduleService.isConfigured) _buildHomeScheduleTile(theme),
               Card(
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(12, 16, 12, 12),
@@ -1888,6 +1899,78 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
               ],
             ],
+          ),
+        );
+      },
+    );
+  }
+
+  // The Schedule tab's first week card, mirrored onto Home as a shortcut into
+  // that tab. Headed "Schedule" rather than by its week, because Home already
+  // has a "This week" card for mileage and two identical headings would be a
+  // coin flip to read.
+  Widget _buildHomeScheduleTile(ThemeData theme) {
+    return FutureBuilder<ScheduleResult>(
+      future: _scheduleFuture ??= _scheduleService.load(),
+      builder: (context, snap) {
+        final weeks = snap.connectionState == ConnectionState.done
+            ? groupByWeek(snap.data?.events ?? const [])
+            : const <ScheduleWeek>[];
+        // Home is a glance surface: a spinner or an error card here would
+        // push the mileage chart around for no gain. The Schedule tab
+        // reports both properly.
+        if (weeks.isEmpty) return const SizedBox.shrink();
+
+        final week = weeks.first;
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: Card(
+            // Without this the ink ripple paints over the rounded corners.
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
+              onTap: () => setState(() {
+                _pageIndex = _indexOfTab('schedule');
+                _scheduleFuture = _scheduleService.load();
+              }),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Schedule',
+                                style: theme.textTheme.titleMedium?.copyWith(
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              Text(
+                                _fmtWeekHeader(week.weekStart, DateTime.now()),
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Icon(
+                          Icons.chevron_right,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    for (final e in week.entries)
+                      _scheduleEntryTile(theme, e, detailMaxLines: 2),
+                  ],
+                ),
+              ),
+            ),
           ),
         );
       },
@@ -1994,7 +2077,14 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _scheduleEntryTile(ThemeData theme, ScheduleEntry e) {
+  // [detailMaxLines] clamps the time/location line. Home passes 2 so a
+  // full street address can't stretch the tile; the Schedule tab leaves it
+  // null so the address is readable in full somewhere.
+  Widget _scheduleEntryTile(
+    ThemeData theme,
+    ScheduleEntry e, {
+    int? detailMaxLines,
+  }) {
     final detail = [
       // An all-day event's start is midnight, which would read "12:00 AM".
       if (e.isAllDay) 'All day' else _fmtClock(e.first),
@@ -2023,6 +2113,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 Text(e.summary, style: theme.textTheme.bodyMedium),
                 Text(
                   detail,
+                  maxLines: detailMaxLines,
+                  overflow: detailMaxLines == null
+                      ? null
+                      : TextOverflow.ellipsis,
                   style: theme.textTheme.bodySmall?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
                   ),

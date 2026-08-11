@@ -17,7 +17,7 @@ This file covers things that aren't obvious from reading the code.
 
 ## App structure
 
-- `lib/main.dart` — all UI: onboarding, the Training / Schedule / Runs / Settings tabs, run detail, debug tools
+- `lib/main.dart` — all UI: onboarding, the Home / Schedule / Runs / Settings tabs, run detail, debug tools. Tab records carry both a `label` (bottom bar) and a `title` (app bar); they differ only on Home, captioned "Home" but titled "Chadwick XC Training"
 - `lib/sync_service.dart` — the sync engine. **No widgets or BuildContext**, because background isolates run it too; progress comes back through an `onProgress` callback and a `SyncResult`
 - `lib/background_sync.dart` — headless entrypoints + scheduling (see below)
 - `lib/auth_service.dart` — sign-in and JWT persistence
