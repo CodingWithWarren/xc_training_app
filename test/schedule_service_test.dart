@@ -402,6 +402,68 @@ END:VEVENT''');
     });
   });
 
+  group('dropPastEntries', () {
+    // Aug 2026: 10th is a Monday, so 10-14 is Mon-Fri of one week.
+    ScheduleEvent ev(int day, {String summary = 'practice'}) =>
+        ScheduleEvent(summary: summary, start: DateTime(2026, 8, day, 8, 30));
+
+    List<ScheduleWeek> on(int day, List<ScheduleEvent> events) =>
+        dropPastEntries(groupByWeek(events), DateTime(2026, 8, day, 12));
+
+    test('a multi-day block survives while any of its days remain', () {
+      // Mon-Wed block, viewed on Tuesday: still present, still "Mon–Wed".
+      final block = [ev(10), ev(11), ev(12)];
+
+      for (final today in [10, 11, 12]) {
+        final weeks = on(today, block);
+        expect(weeks.single.entries, hasLength(1), reason: 'on Aug $today');
+        expect(
+          compactDayLabel(weeks.single.entries.single.starts),
+          'Mon–Wed',
+          reason: 'label must not shrink mid-block on Aug $today',
+        );
+      }
+    });
+
+    test('a multi-day block disappears the day after it ends', () {
+      // Same Mon-Wed block, now viewed on Thursday.
+      expect(on(13, [ev(10), ev(11), ev(12)]), isEmpty);
+    });
+
+    test('a single-day event survives its own day', () {
+      // Still listed in the afternoon, though it started at 8:30am.
+      expect(on(12, [ev(12)]).single.entries, hasLength(1));
+    });
+
+    test('a single-day event disappears the next day', () {
+      expect(on(13, [ev(12)]), isEmpty);
+    });
+
+    test('past entries go while future ones in the same week stay', () {
+      final weeks = on(13, [
+        ev(10, summary: 'past'),
+        ev(14, summary: 'upcoming'),
+      ]);
+
+      expect(weeks.single.entries.map((e) => e.summary), ['upcoming']);
+    });
+
+    test('a week with nothing left is removed entirely', () {
+      final weeks = on(20, [
+        ev(10, summary: 'last week'),
+        ev(21, summary: 'this week'),
+      ]);
+
+      expect(weeks, hasLength(1));
+      expect(weeks.single.entries.single.summary, 'this week');
+    });
+
+    test('leaves an all-upcoming schedule untouched', () {
+      final weeks = groupByWeek([ev(20), ev(21)]);
+      expect(dropPastEntries(weeks, DateTime(2026, 8, 19)), hasLength(1));
+    });
+  });
+
   group('compactDayLabel', () {
     DateTime aug(int day) => DateTime(2026, 8, day, 8, 30);
 

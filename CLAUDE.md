@@ -82,6 +82,8 @@ Two things that aren't obvious:
 
 Supported rules: `DAILY`, `WEEKLY` (with `BYDAY`), `MONTHLY`, `YEARLY`, each with `INTERVAL` / `COUNT` / `UNTIL`. Positional forms (`BYDAY=2TU`, "second Tuesday") deliberately fall back to a single occurrence rather than emitting wrong dates.
 
+**"Hide past events"** (Settings; `hide_past_events`, defaults on) drops finished practices and meets via `dropPastEntries`. It filters **whole entries, never individual occurrences** — a Mon–Wed block still reads "Mon–Wed" on Wednesday and disappears only on Thursday. Trimming occurrence-by-occurrence would relabel it mid-week ("Tue–Wed", then "Wed"), which reads as the coach having changed the schedule rather than as time passing. This is also why `lookbehind` is a **full week** rather than a day: the earlier occurrences must stay in the parse window for the label to hold its shape.
+
 The last good feed body is cached in `shared_preferences` so the schedule survives no connectivity; the UI labels it as a saved copy rather than passing it off as live.
 
 ## Auth

@@ -61,6 +61,10 @@ const double _metersPerMile = 1609.344;
 // which keeps the user in onboarding.
 const String _routeAccessDonePrefsKey = 'route_access_done';
 
+// shared_preferences key — Schedule tab: hide practices and meets once
+// they're fully past. Defaults to on; absent means the user hasn't changed it.
+const String _hidePastEventsPrefsKey = 'hide_past_events';
+
 // shared_preferences key — iOS only: the health permission sheet has been
 // shown and accepted. HealthKit never discloses READ-grant status (the
 // plugin's hasPermissions returns null for reads), so without this flag every
@@ -444,6 +448,9 @@ class _HomeScreenState extends State<HomeScreen> {
   );
   Future<ScheduleResult>? _scheduleFuture;
 
+  // Schedule tab: drop events once they're fully past. On by default.
+  bool _hidePastEvents = true;
+
   // Bottom-nav page index. Release: 0 = Home, 1 = Runs. Debug builds add
   // 2 = Debug tools.
   int _pageIndex = 0;
@@ -501,6 +508,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _autoSyncEnabled = prefs.containsKey(autoSyncPrefsKey)
           ? prefs.getBool(autoSyncPrefsKey)
           : null;
+      _hidePastEvents = prefs.getBool(_hidePastEventsPrefsKey) ?? true;
     });
     await _configureHealth();
     if (!mounted) return;
@@ -1905,6 +1913,19 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Future<void> _setHidePastEvents(bool enabled) async {
+    setState(() => _hidePastEvents = enabled);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_hidePastEventsPrefsKey, enabled);
+  }
+
+  // Grouped weeks as the user has chosen to see them. Shared by Home and the
+  // Schedule tab so the two can't disagree about what's still upcoming.
+  List<ScheduleWeek> _visibleWeeks(ScheduleResult result) {
+    final weeks = groupByWeek(result.events);
+    return _hidePastEvents ? dropPastEntries(weeks, DateTime.now()) : weeks;
+  }
+
   // The Schedule tab's first week card, mirrored onto Home as a shortcut into
   // that tab. Headed "Schedule" rather than by its week, because Home already
   // has a "This week" card for mileage and two identical headings would be a
@@ -1913,8 +1934,10 @@ class _HomeScreenState extends State<HomeScreen> {
     return FutureBuilder<ScheduleResult>(
       future: _scheduleFuture ??= _scheduleService.load(),
       builder: (context, snap) {
-        final weeks = snap.connectionState == ConnectionState.done
-            ? groupByWeek(snap.data?.events ?? const [])
+        final result = snap.data;
+        final weeks =
+            snap.connectionState == ConnectionState.done && result != null
+            ? _visibleWeeks(result)
             : const <ScheduleWeek>[];
         // Home is a glance surface: a spinner or an error card here would
         // push the mileage chart around for no gain. The Schedule tab
@@ -1998,7 +2021,7 @@ class _HomeScreenState extends State<HomeScreen> {
               snap.data ??
               ScheduleResult(events: const [], error: '${snap.error}');
           final now = DateTime.now();
-          final weeks = groupByWeek(result.events);
+          final weeks = _visibleWeeks(result);
 
           return ListView(
             padding: const EdgeInsets.all(16),
@@ -2318,6 +2341,20 @@ class _HomeScreenState extends State<HomeScreen> {
               onChanged: _uploading ? null : (v) => _setAutoSync(v),
             ),
           ),
+          if (_scheduleService.isConfigured) ...[
+            const SizedBox(height: 16),
+            Card(
+              child: SwitchListTile(
+                title: const Text('Hide past events'),
+                subtitle: const Text(
+                  'Remove practices and meets from the schedule once every '
+                  'day of the event has passed',
+                ),
+                value: _hidePastEvents,
+                onChanged: _setHidePastEvents,
+              ),
+            ),
+          ],
           if (!_uploading) ...[
             const SizedBox(height: 16),
             Text(

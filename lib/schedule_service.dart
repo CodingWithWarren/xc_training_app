@@ -105,9 +105,12 @@ class ScheduleService {
   /// otherwise unbounded, so expansion needs a horizon.
   static const Duration lookahead = Duration(days: 120);
 
-  /// How far back to keep events, so "today" still shows a practice that
-  /// already started this afternoon.
-  static const Duration lookbehind = Duration(days: 1);
+  /// How far back to keep events. A full week, so a collapsed entry holds
+  /// its shape as the week progresses: a Mon–Wed block still reads "Mon–Wed"
+  /// when viewed on Wednesday instead of shrinking day by day as
+  /// occurrences drop out of the window. Hiding what's finished is
+  /// [dropPastEntries]' job, at whole-entry granularity.
+  static const Duration lookbehind = Duration(days: 7);
 
   /// Download, parse, and expand the feed. Falls back to the cached copy
   /// when the network fails, so this only returns an empty list when
@@ -266,6 +269,32 @@ List<ScheduleWeek> groupByWeek(List<ScheduleEvent> events) {
           ..sort((a, b) => a.first.compareTo(b.first)),
       ),
   ];
+}
+
+/// Drop entries that are entirely in the past, plus any week left empty.
+///
+/// Granularity is the whole entry, never the individual occurrence: a
+/// Mon–Wed practice block still reads "Mon–Wed" on Tuesday and Wednesday
+/// and vanishes only on Thursday. Trimming occurrence-by-occurrence would
+/// relabel it mid-week — "Tue–Wed", then "Wed" — which reads as the coach
+/// having changed the schedule rather than as time passing.
+///
+/// Anything today survives regardless of the clock, so this morning's
+/// practice is still listed this afternoon.
+List<ScheduleWeek> dropPastEntries(List<ScheduleWeek> weeks, DateTime now) {
+  final today = DateTime(now.year, now.month, now.day);
+  final out = <ScheduleWeek>[];
+
+  for (final w in weeks) {
+    final kept = [
+      for (final e in w.entries)
+        if (e.starts.any((s) => !s.isBefore(today))) e,
+    ];
+    if (kept.isNotEmpty) {
+      out.add(ScheduleWeek(weekStart: w.weekStart, entries: kept));
+    }
+  }
+  return out;
 }
 
 const List<String> _dayNames = [
