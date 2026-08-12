@@ -20,6 +20,7 @@ import 'background_sync.dart'
         lastBackgroundSyncPrefsKey,
         scheduleAndroidSync,
         workManagerCallbackDispatcher;
+import 'coach_mail.dart';
 import 'sync_service.dart';
 import 'training_week.dart';
 
@@ -359,6 +360,140 @@ Future<void> main() async {
   runApp(const XCTrainingApp());
 }
 
+// Full view behind the Training page's "From your coach" card: the complete
+// digest, then the emails it was built from so the athlete can check the
+// summary against the source (and read anything it left out).
+class _CoachDigestPage extends StatelessWidget {
+  const _CoachDigestPage({required this.digest, required this.messages});
+
+  final CoachDigest? digest;
+  final List<CoachMessage> messages;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final d = digest;
+    return Scaffold(
+      appBar: AppBar(title: const Text('From your coach')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          if (d != null && d.headline.isNotEmpty) ...[
+            Text(
+              d.headline,
+              style: theme.textTheme.titleLarge?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 16),
+            for (final b in d.bullets) _bullet(theme, Icons.circle, b, size: 8),
+            if (d.actions.isNotEmpty) ...[
+              const SizedBox(height: 20),
+              Text(
+                'To do',
+                style: theme.textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 8),
+              for (final a in d.actions)
+                _bullet(theme, Icons.check_box_outline_blank, a, size: 16),
+            ],
+            const SizedBox(height: 20),
+            Text(
+              'Summaries are generated automatically and can miss details — '
+              'the original emails are below.',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const Divider(height: 32),
+          ],
+          Text(
+            messages.isEmpty
+                ? 'No emails'
+                : '${messages.length} '
+                      '${messages.length == 1 ? "email" : "emails"}',
+            style: theme.textTheme.titleMedium?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 4),
+          for (final m in messages)
+            Card(
+              margin: const EdgeInsets.only(top: 8),
+              child: ExpansionTile(
+                shape: const Border(),
+                title: Text(
+                  m.subject,
+                  style: theme.textTheme.bodyLarge?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                subtitle: Text(
+                  '${m.displaySender} · ${_fmtMailDate(m.date)}',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                    child: SelectableText(
+                      m.body.isEmpty ? '(empty message)' : m.body,
+                      style: theme.textTheme.bodyMedium,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _bullet(
+    ThemeData theme,
+    IconData icon,
+    String text, {
+    required double size,
+  }) => Padding(
+    padding: const EdgeInsets.only(bottom: 10),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: EdgeInsets.only(top: size == 8 ? 7 : 2, right: 10),
+          child: Icon(icon, size: size, color: theme.colorScheme.primary),
+        ),
+        Expanded(child: Text(text, style: theme.textTheme.bodyMedium)),
+      ],
+    ),
+  );
+
+  static String _fmtMailDate(DateTime date) {
+    final d = date.toLocal();
+    const months = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
+    final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+    final ampm = d.hour < 12 ? 'AM' : 'PM';
+    return '${months[d.month - 1]} ${d.day}, $h:'
+        '${d.minute.toString().padLeft(2, '0')} $ampm';
+  }
+}
+
 class XCTrainingApp extends StatelessWidget {
   const XCTrainingApp({super.key});
 
@@ -426,6 +561,14 @@ class _HomeScreenState extends State<HomeScreen> {
   // Cached future for the Runs tab: workouts other apps wrote to Health
   // Connect, grouped into logical runs. Refreshed when the tab is opened.
   Future<List<_HcRun>>? _hcRunsFuture;
+
+  // Coach-email digest shown at the top of the Training page. Null until the
+  // first fetch (or the cached copy) lands; the card renders nothing at all
+  // until the server answers with a digest, so it stays invisible on servers
+  // that don't implement the endpoint (see coach_mail.dart).
+  late final CoachMailService _coachMail = CoachMailService(auth: _auth);
+  CoachMailResult? _coachResult;
+  bool _coachRefreshing = false;
 
   // Bottom-nav page index. Release: 0 = Home, 1 = Runs. Debug builds add
   // 2 = Debug tools.
@@ -495,6 +638,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // refresh the "anything new to upload?" home status.
   void _afterSignedIn() {
     if (!_onboarded) return; // onboarding UI takes over
+    _loadCoachMail();
     if (_autoSyncEnabled == true && !_uploading) {
       // Ensure the periodic background task exists (survives reboot, but a
       // reinstall clears it) — idempotent, Android-only.
@@ -553,6 +697,33 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _pendingSamples = pending;
       _lastSyncAt = last!.toLocal();
+    });
+  }
+
+  // Paints the coach card from cache first, then goes to the network. Without
+  // the cached pass the card would pop in a second or two after the rest of
+  // the page, which reads as a glitch on every launch.
+  Future<void> _loadCoachMail({bool force = false}) async {
+    if (_coachMail.isUnavailable || !_auth.isSignedIn) return;
+    if (_coachResult == null) {
+      final cached = await _coachMail.loadCached();
+      if (!mounted) return;
+      if (cached.digest != null) setState(() => _coachResult = cached);
+    }
+    if (_coachRefreshing) return;
+    setState(() => _coachRefreshing = true);
+    // force = the user asked for it (Settings → Re-summarize), which makes the
+    // server re-poll the mailbox; the normal path just reads its cached copy.
+    final result = force
+        ? await _coachMail.refresh()
+        : await _coachMail.fetch();
+    if (!mounted) return;
+    setState(() {
+      _coachRefreshing = false;
+      // A failed fetch carries the cached digest forward, so replacing the old
+      // result is safe — the card keeps showing the last good summary with the
+      // error underneath it.
+      _coachResult = result;
     });
   }
 
@@ -1745,11 +1916,15 @@ class _HomeScreenState extends State<HomeScreen> {
           onRefresh: () async {
             final future = _loadHcRuns();
             setState(() => _hcRunsFuture = future);
-            await future;
+            await Future.wait([future, _loadCoachMail()]);
           },
           child: ListView(
             padding: const EdgeInsets.all(16),
             children: [
+              // Coach mail sits above the training numbers: it's the only
+              // time-sensitive thing on this page (practice moved, meet
+              // logistics), and it self-hides when unconfigured.
+              ..._coachCard(theme),
               Card(
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
@@ -1849,6 +2024,186 @@ class _HomeScreenState extends State<HomeScreen> {
         );
       },
     );
+  }
+
+  // "From your coach" — the server's digest of recently forwarded coach email.
+  // Returns an empty list (so the Training page looks exactly as it did
+  // before) until the server actually answers with one: a server that doesn't
+  // implement /coach-digest yields notConfigured and no card ever appears.
+  List<Widget> _coachCard(ThemeData theme) {
+    final result = _coachResult;
+    if (result == null || result.status == CoachMailStatus.notConfigured) {
+      return const [];
+    }
+    final digest = result.digest;
+    final hasDetail = digest != null || result.messages.isNotEmpty;
+
+    final Widget content;
+    if (digest != null && digest.headline.isNotEmpty) {
+      content = Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            digest.headline,
+            style: theme.textTheme.bodyLarge?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          // Three bullets is what fits above the fold; the rest are on the
+          // detail page behind the tap.
+          for (final b in digest.bullets.take(3))
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('•  ', style: theme.textTheme.bodyMedium),
+                  Expanded(child: Text(b, style: theme.textTheme.bodyMedium)),
+                ],
+              ),
+            ),
+          if (digest.actions.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.checklist,
+                    size: 16,
+                    color: theme.colorScheme.primary,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    digest.actions.length == 1
+                        ? '1 thing to do'
+                        : '${digest.actions.length} things to do',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.primary,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      );
+    } else if (_coachRefreshing) {
+      content = Text(
+        'Checking for coach email…',
+        style: theme.textTheme.bodyMedium?.copyWith(
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+      );
+    } else if (result.status == CoachMailStatus.empty) {
+      content = Text(
+        'No coach email yet.',
+        style: theme.textTheme.bodyMedium?.copyWith(
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+      );
+    } else {
+      content = Text(
+        'Pull down to check for coach email.',
+        style: theme.textTheme.bodyMedium?.copyWith(
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+      );
+    }
+
+    return [
+      Card(
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: hasDetail
+              ? () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => _CoachDigestPage(
+                      digest: digest,
+                      messages: result.messages,
+                    ),
+                  ),
+                )
+              : null,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 12, 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      Icons.mark_email_unread_outlined,
+                      size: 20,
+                      color: theme.colorScheme.primary,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      'From your coach',
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const Spacer(),
+                    if (_coachRefreshing)
+                      const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    else if (hasDetail)
+                      Icon(
+                        Icons.chevron_right,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    if (!_coachRefreshing && !hasDetail)
+                      const SizedBox(width: 12),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: content,
+                ),
+                if (digest != null && digest.headline.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    'Summarized ${_fmtAgo(digest.generatedAt)} from '
+                    '${digest.sourceCount} '
+                    '${digest.sourceCount == 1 ? "email" : "emails"}',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+                // Errors are shown under whatever we managed to render, so a
+                // flaky network degrades the card instead of blanking it.
+                if (result.status == CoachMailStatus.error &&
+                    result.message.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    result.message,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.error,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+      const SizedBox(height: 12),
+    ];
+  }
+
+  // "3h ago" / "2d ago" — coarse on purpose; the exact minute never matters
+  // for a summary of email.
+  String _fmtAgo(DateTime when) {
+    final diff = DateTime.now().difference(when);
+    if (diff.inMinutes < 1) return 'just now';
+    if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
+    if (diff.inHours < 24) return '${diff.inHours}h ago';
+    return '${diff.inDays}d ago';
   }
 
   // One of the three big numbers on the "This week" card.
@@ -1974,6 +2329,7 @@ class _HomeScreenState extends State<HomeScreen> {
               onChanged: _uploading ? null : (v) => _setAutoSync(v),
             ),
           ),
+          ..._coachSettingsCard(theme),
           if (!_uploading) ...[
             const SizedBox(height: 16),
             Text(
@@ -1986,6 +2342,75 @@ class _HomeScreenState extends State<HomeScreen> {
         ],
       ),
     );
+  }
+
+  // Coach-digest controls. "Re-summarize" asks the server to re-poll the
+  // mailbox now; the normal path only reads the server's cached digest, so
+  // without this there'd be no way to pull in mail that just arrived.
+  List<Widget> _coachSettingsCard(ThemeData theme) {
+    final result = _coachResult;
+    if (result == null || result.status == CoachMailStatus.notConfigured) {
+      return const [];
+    }
+    final digest = result.digest;
+    return [
+      const SizedBox(height: 16),
+      Card(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Coach email',
+                style: theme.textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Summarized on the server from the mail you forward to it.',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              if (digest != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  'Last summarized ${_fmtAgo(digest.generatedAt)}',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: _coachRefreshing
+                        ? null
+                        : () => _loadCoachMail(force: true),
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('Re-summarize'),
+                  ),
+                  const SizedBox(width: 8),
+                  TextButton(
+                    onPressed: _coachRefreshing
+                        ? null
+                        : () async {
+                            await _coachMail.clearCache();
+                            if (!mounted) return;
+                            setState(() => _coachResult = null);
+                          },
+                    child: const Text('Clear'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    ];
   }
 
   // ============================================================

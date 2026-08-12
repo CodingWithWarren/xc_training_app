@@ -277,7 +277,11 @@ class SyncService {
   }) async {
     // Workouts use the package's special WORKOUT path (it aggregates
     // distance/calories/steps from related records). Separate read.
-    final allWorkouts = await safeRead(HealthDataType.WORKOUT, windowStart, now);
+    final allWorkouts = await safeRead(
+      HealthDataType.WORKOUT,
+      windowStart,
+      now,
+    );
     final windowWorkoutUuids = {for (final w in allWorkouts) w.uuid};
 
     // Reconciliation: skip workouts the server already has (tracked locally by
@@ -286,9 +290,7 @@ class SyncService {
     // a watermark-forward sync would never revisit.
     final workouts = skipWorkoutUuids.isEmpty
         ? allWorkouts
-        : allWorkouts
-              .where((w) => !skipWorkoutUuids.contains(w.uuid))
-              .toList();
+        : allWorkouts.where((w) => !skipWorkoutUuids.contains(w.uuid)).toList();
 
     // Padded, merged time ranges around the recorded workouts — the only
     // ranges the continuous streams are read from. Merging keeps overlapping
@@ -436,8 +438,7 @@ class SyncService {
       if (backfill) payload['backfill'] = true;
       final totalSamples = built.totalSamples;
       final newWorkoutCount = (payload['workouts'] as List).length;
-      final alreadyOnServer =
-          built.windowWorkoutUuids.length - newWorkoutCount;
+      final alreadyOnServer = built.windowWorkoutUuids.length - newWorkoutCount;
 
       final bodyBytes = utf8.encode(jsonEncode(payload));
       final sizeMB = (bodyBytes.length / 1024 / 1024).toStringAsFixed(2);

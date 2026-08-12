@@ -22,6 +22,7 @@ This file covers things that aren't obvious from reading the code.
 - `lib/background_sync.dart` — headless entrypoints + scheduling (see below)
 - `lib/auth_service.dart` — sign-in and JWT persistence
 - `lib/training_week.dart` — weekly mileage bucketing and chart, deliberately free of `health` types so it unit tests without a device
+- `lib/coach_mail.dart` — the coach-email digest client (see below). Same no-widgets rule as `sync_service.dart`; the http client is injectable so it unit tests without a server
 
 ## Background sync
 
@@ -36,6 +37,20 @@ Two things that bite:
 - **`prefs.reload()` before reading anything a background isolate wrote.** `SharedPreferences` caches in-process, so the UI isolate won't see out-of-process writes without it — this is why "Last Background Sync" once showed "never" right after a sync that had demonstrably succeeded.
 
 Background runs are otherwise invisible, so every attempt records its outcome to `lastBackgroundSyncPrefsKey` for the debug page to display.
+
+## Coach email digest
+
+The **server** owns this: it polls the mailbox the athlete forwards coach mail into, summarizes it, and serves `GET /coach-digest` + `POST /coach-digest/refresh`. `lib/coach_mail.dart` is only a client. The contract, the recommended summarization prompt, the IMAP gotchas, and suggested tables are all in [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md) "Coach email digest".
+
+Client-side things that aren't obvious from the code:
+
+- **The server half doesn't exist yet.** The app ships the client anyway because **`404`/`501` means "not deployed"**, not "error": the service latches `isUnavailable`, hides the card entirely, and stops calling for the session. So this is inert against today's server and turns itself on when the endpoint appears — no app update. Don't "fix" a 404 into a visible error.
+- **No new secrets in the app.** Nothing was added to `config/dev.json`; if you find yourself adding a mailbox password or a model API key to a dart-define, the feature has drifted back into the binary and out of the server.
+- **The card is gated on having a result, not on config.** `_coachCard` returns `const []` until `_coachResult` is non-null and not `notConfigured`, so the Training tab is byte-identical to before on servers without the feature.
+- **Two timeouts on purpose:** 20s for the cached `GET`, 90s for the refresh `POST` (which makes the server go out to the mailbox and call a model).
+- **Errors render *under* the cached digest, never instead of it.** Every failure path carries `cached.digest`/`cached.messages` forward — that's why the card degrades on a flaky network instead of blanking.
+- **`http.Response(body, status)` encodes as latin1 unless the headers name a charset**, which throws on the em-dash a real summary will contain. Tests must build responses with `content-type: application/json; charset=utf-8` (see `jsonOk` in `test/coach_mail_test.dart`) or they fail for a reason that has nothing to do with the code under test.
+- The digest runs **foreground only** — deliberately not in `runBackgroundSyncBody()`.
 
 ## Coding conventions
 

@@ -48,15 +48,32 @@ Working end-to-end on Android and iOS phones.
 
 **Training views** — a Training tab (this week's run miles / runs / time, the change vs last week, a four-week mileage chart, recent activity) and a Runs tab listing each workout with distance, duration, and pace. Tapping a run shows its GPS route on a map plus its metrics. All computed on-device, so they work offline.
 
+**Coach email digest** — optional card at the top of the Training tab summarizing recent email from your coach. Requires a server that implements the digest endpoints; the card is invisible otherwise. See below.
+
+## Coach email digest
+
+Forward coach email to a mailbox the **server** owns, and the app shows a summary at the top of the Training tab: a one-line headline, a few bullets, and a "things to do" count, with the original emails one tap away.
+
+The server does all the work — it polls the mailbox, summarizes with an LLM, and serves the result per athlete. The app only fetches and renders. That keeps the mailbox credentials and the model API key on the server instead of compiled into a binary anyone can unzip, and summarizes each email once for the whole team rather than once per device. There is nothing to configure in the app and no new secrets in `config/dev.json`.
+
+**Status:** the app side is done and shipped. The endpoints don't exist on the server yet — `GET /coach-digest` and `POST /coach-digest/refresh`, specified in [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md) "Coach email digest" along with the recommended prompt, IMAP gotchas, and suggested tables. Until they're deployed the app's calls 404 and **the card never appears**, so this is safe to ship as-is; it lights up on its own once the server answers, with no app update.
+
+**Behavior once the server is live**
+
+- Fetches on app open and on pull-to-refresh; Settings → *Coach email* → **Re-summarize** makes the server re-poll the mailbox immediately.
+- The last digest is cached on the phone, so the card paints instantly on launch and still says something useful offline. Server errors appear *under* the cached summary rather than blanking it.
+- An expired session sends you back to sign-in, same as sync.
+
 ## Roadmap
 
 Still open:
 
 1. Server-backed views — season history and team/coach features (leaderboard, roster, assigned workouts) need new server endpoints
-2. Run detail depth — per-mile splits, HR-zone breakdown, pace-colored route
-3. iOS: TestFlight / App Store distribution (needs the paid Apple Developer Program)
-4. Remove the debug-only UI section (already hidden in release builds)
-5. Drop the local-dev cleartext exceptions (`usesCleartextTraffic` on Android, `NSAllowsArbitraryLoads` on iOS) once local-HTTP development is no longer needed
+2. Coach email digest **server side** — the app client is written and waiting; the server still needs to poll the mailbox, summarize, and serve `GET /coach-digest` + `POST /coach-digest/refresh` (contract in [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md))
+3. Run detail depth — per-mile splits, HR-zone breakdown, pace-colored route
+4. iOS: TestFlight / App Store distribution (needs the paid Apple Developer Program)
+5. Remove the debug-only UI section (already hidden in release builds)
+6. Drop the local-dev cleartext exceptions (`usesCleartextTraffic` on Android, `NSAllowsArbitraryLoads` on iOS) once local-HTTP development is no longer needed
 
 Already shipped (was on the roadmap):
 
@@ -73,5 +90,6 @@ Already shipped (was on the roadmap):
 - [lib/background_sync.dart](lib/background_sync.dart) — headless entrypoints and scheduling for Android and iOS background sync
 - [lib/auth_service.dart](lib/auth_service.dart) — Google / dev sign-in and JWT persistence
 - [lib/training_week.dart](lib/training_week.dart) — weekly mileage bucketing and the chart (unit tested in [test/](test/))
+- [lib/coach_mail.dart](lib/coach_mail.dart) — coach email digest client: fetches the server's digest and caches it, free of any UI (unit tested in [test/](test/))
 - [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md) — upload contract: payload shape, dedup strategy, suggested Postgres tables, session-detection algorithm
 - [CLAUDE.md](CLAUDE.md) — coding conventions, server/auth config, and Android/Health Connect + iOS/HealthKit gotchas
