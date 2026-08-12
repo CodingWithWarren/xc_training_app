@@ -83,6 +83,36 @@ Already shipped (was on the roadmap):
 - **GPS routes** — read from Health Connect via a native route-consent flow (see [CLAUDE.md](CLAUDE.md)), so the planned Strava OAuth path isn't needed.
 - **Server-side session detection from raw streams** — obsoleted by the workout-only upload policy (raw 24/7 streams are no longer uploaded); detection/classification now applies only within uploaded workout windows.
 
+## Contributing
+
+The team repo is **[CodingWithWarren/xc_training_app](https://github.com/CodingWithWarren/xc_training_app)** — clone it directly, no fork needed. Ask Warren for write access to the org.
+
+```bash
+git clone git@github.com:CodingWithWarren/xc_training_app.git
+cd xc_training_app
+flutter pub get
+cp config/dev.json.example config/dev.json    # per-developer, gitignored
+```
+
+Then branch, work, and open a pull request against `main`:
+
+```bash
+git switch -c feature/short-description
+# ... work ...
+dart format lib test && flutter analyze && flutter test    # all three must be clean
+git push -u origin feature/short-description
+gh pr create --base main                                   # or open it on github.com
+```
+
+Two things that are **per-developer and must not be committed**:
+
+- **`config/dev.json`** — your server URL and Google client ID. Already gitignored; copy the `.example` and edit.
+- **iOS signing.** `ios/Runner.xcodeproj/project.pbxproj` has a `DEVELOPMENT_TEAM` and bundle ID committed to it. To build on your own iPhone you have to change both in Xcode (Runner target → Signing & Capabilities → your team; and a bundle ID nobody else is using). **Leave that change out of your commits** — `git add` the files you touched rather than `git add -A`, or the next person's build breaks. See [CLAUDE.md](CLAUDE.md) "iOS / HealthKit gotchas".
+
+Android needs neither — `flutter run` works after `flutter pub get`.
+
+The original project this was built from is [briansp2020/xc_training_app](https://github.com/briansp2020/xc_training_app); it's wired up locally as the `briansp2020` remote if you need to pull changes from it.
+
 ## Where things live
 
 - [lib/main.dart](lib/main.dart) — UI: onboarding, the Training / Runs / Settings tabs, the run detail page, and the debug tools
