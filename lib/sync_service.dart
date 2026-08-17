@@ -191,6 +191,13 @@ class SyncService {
     return workouts.where((w) => !uploaded.contains(w.uuid)).length;
   }
 
+  // Health read failures seen since the last [sync] started. safeRead can't
+  // throw (an unpermissioned type is expected and must not abort the run), but
+  // swallowing it entirely made a sync whose every read was denied report
+  // "ok — 0 workouts", which is what hid the missing Health Connect
+  // background-read permission. Collected here and reported in the SyncResult.
+  final List<String> _readErrors = [];
+
   Future<List<HealthDataPoint>> safeRead(
     HealthDataType t,
     DateTime start,
@@ -215,8 +222,11 @@ class SyncService {
         }
       } catch (e, st) {
         // Don't crash the caller — expected for unpermissioned types — but
-        // log so it's still visible in the dev console.
+        // log so it's still visible in the dev console, and record it so the
+        // sync result can say the read failed instead of reporting an empty
+        // window as a clean sync.
         debugPrint('[_safeRead] ${t.name} $cursor..$sliceEnd failed: $e\n$st');
+        _readErrors.add('${t.name}: $e');
       }
       cursor = sliceEnd;
     }
@@ -394,6 +404,7 @@ class SyncService {
     bool backfill = false,
     void Function(String status)? onProgress,
   }) async {
+    _readErrors.clear(); // report only the reads this run attempted
     onProgress?.call('Checking server...');
     // Fail fast when the server is down instead of hanging on the upload.
     if (!await serverReachable()) {
@@ -455,11 +466,16 @@ class SyncService {
           .timeout(const Duration(seconds: 120));
 
       final ok = response.statusCode >= 200 && response.statusCode < 300;
-      if (ok) {
+      if (ok && _readErrors.isEmpty) {
         // Everything in the window is now on the server — the skipped ones were
         // already there, the new ones we just sent. Remember the full set so
         // the next sync skips their samples; keyed to the window, so it prunes
         // itself as workouts age past the horizon.
+        //
+        // Only when every read succeeded: a workout whose HR/step read failed
+        // was uploaded without its samples, and marking it done here would make
+        // every later sync skip it — turning a transient read failure into a
+        // permanent gap.
         await _saveUploadedWorkouts(built.windowWorkoutUuids);
       }
 
@@ -499,19 +515,28 @@ class SyncService {
                 'grant "Exercise routes → Always allow" in Health Connect → '
                 'App permissions → Chadwick XC Training, then Sync again.'
           : '';
+      // A run whose Health reads all failed uploads an empty payload and gets
+      // a 200 back — reporting that as a clean sync is how the missing
+      // background-read permission stayed invisible. Say what failed, and
+      // don't call it ok.
+      final distinct = _readErrors.toSet().toList();
+      final readMsg = distinct.isEmpty
+          ? ''
+          : '\n${_readErrors.length} health read(s) failed, so the counts '
+                'above are incomplete:\n${distinct.take(3).join('\n')}';
       if (ok) {
         return SyncResult(
-          SyncStatus.ok,
+          distinct.isEmpty ? SyncStatus.ok : SyncStatus.error,
           'Synced $sizeMB MB (last ${historyWindow.inDays} days): '
           '$newWorkoutCount new workout(s) uploaded, '
           '$alreadyOnServer already on server, $totalSamples samples. '
-          'Server: ${response.statusCode}.$routeMsg$consentMsg',
+          'Server: ${response.statusCode}.$routeMsg$consentMsg$readMsg',
         );
       }
       return SyncResult(
         SyncStatus.httpError,
         'Health upload failed: ${response.statusCode}.$routeMsg$consentMsg\n'
-        '${response.body}',
+        '${response.body}$readMsg',
       );
     } catch (e) {
       return SyncResult(SyncStatus.error, 'Sync error: $e');

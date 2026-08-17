@@ -64,9 +64,21 @@ Future<bool> runBackgroundSyncBody(String trigger) async {
     } else {
       final health = Health();
       await health.configure();
+      // Health Connect denies reads made outside the foreground unless the
+      // background-read permission is granted — and denies them by returning
+      // nothing, so the sync below would otherwise report a clean run that
+      // uploaded zero workouts. Record the grant state next to the outcome so
+      // the debug page shows the cause rather than just the symptom. iOS has no
+      // such gate (the call returns true there).
+      final backgroundReads = await health.isHealthDataInBackgroundAuthorized();
       final result = await SyncService(auth: auth, health: health).sync();
       success = result.status == SyncStatus.ok;
       summary = '${result.status.name}: ${result.message}';
+      if (!backgroundReads) {
+        summary =
+            'Health Connect background reads NOT authorized — '
+            'this run could not see any health data.\n$summary';
+      }
     }
   } catch (e) {
     summary = 'error: $e';

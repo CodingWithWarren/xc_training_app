@@ -24,6 +24,15 @@
     <!-- Blanket "Exercise routes" permission (Android 15+). Requested via the
          native MethodChannel in MainActivity — the health plugin can't. -->
     <uses-permission android:name="android.permission.health.READ_EXERCISE_ROUTES"/>
+    <!-- Health Connect blocks reads made while the app is NOT in the foreground
+         unless this is declared AND granted. The WorkManager background sync
+         runs in a headless isolate, so without it every read there comes back
+         empty and the sync "succeeds" having uploaded nothing. Requested from
+         the auto-upload step (see _ensureBackgroundHealthAccess in main.dart) —
+         it is a separate Health Connect grant, not part of the data-type
+         permissions. HealthKit has no equivalent gate, which is why iOS
+         background sync worked without it. -->
+    <uses-permission android:name="android.permission.health.READ_HEALTH_DATA_IN_BACKGROUND"/>
 
     <!-- GPS route recording. geolocator_android declares a location-typed
          foreground service; with it running, Android keeps location flowing

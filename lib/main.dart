@@ -58,6 +58,13 @@ const String _routeAccessDonePrefsKey = 'route_access_done';
 // cold launch would treat permissions as missing and re-show onboarding.
 const String _healthPermsRequestedPrefsKey = 'health_perms_requested';
 
+// shared_preferences key — Android only: the Health Connect background-read
+// permission sheet has been shown once. Health Connect denies reads made
+// outside the foreground without that grant, so the WorkManager sync needs it;
+// asking is gated on this flag so a user who declines isn't re-prompted every
+// launch. See _ensureBackgroundHealthAccess.
+const String _bgHealthAskedPrefsKey = 'bg_health_access_asked';
+
 // Moving-average window for smoothing the *displayed* GPS path — tames the
 // zigzag from GPS jitter. Raw points are kept intact; only the drawn polyline
 // is smoothed. Higher = smoother but rounds corners more; 1 disables.
@@ -552,6 +559,12 @@ class _HomeScreenState extends State<HomeScreen> {
   bool get _onboarded =>
       _permissionsGranted && _routeAccessDone && _autoSyncEnabled != null;
 
+  // Android only: automatic upload is on but Health Connect hasn't granted
+  // background reads, so the scheduled syncs can't see any data. Drives the
+  // warning under the automatic-upload switch. See
+  // _ensureBackgroundHealthAccess.
+  bool _bgReadsBlocked = false;
+
   // Home-page upload status: recorded workouts newer than the server's
   // watermark. null = check in progress; -1 = never synced;
   // -2 = server unreachable.
@@ -643,6 +656,10 @@ class _HomeScreenState extends State<HomeScreen> {
       // Ensure the periodic background task exists (survives reboot, but a
       // reinstall clears it) — idempotent, Android-only.
       scheduleAndroidSync();
+      // Background syncs are useless without Health Connect's background-read
+      // grant. Also covers installs that enabled automatic upload before the
+      // app started asking for it; the ask happens at most once.
+      _ensureBackgroundHealthAccess();
       _syncHealthData(); // calls _refreshPendingData when done
     } else {
       _refreshPendingData();
@@ -735,6 +752,9 @@ class _HomeScreenState extends State<HomeScreen> {
     // Start/stop periodic background sync to match the choice (Android-only).
     if (enabled) {
       await scheduleAndroidSync();
+      // Scheduling a background sync is pointless without the background-read
+      // grant — ask for it here, while the app is in the foreground.
+      await _ensureBackgroundHealthAccess();
     } else {
       await cancelAndroidSync();
     }
@@ -1039,6 +1059,42 @@ class _HomeScreenState extends State<HomeScreen> {
         result.status == SyncStatus.error) {
       _refreshPendingData();
     }
+  }
+
+  // Health Connect treats "read health data in the background" as its own
+  // grant, separate from the per-type read permissions requested above. The
+  // WorkManager sync runs in a headless isolate — i.e. not in the foreground —
+  // so without it every background read is denied and the sync uploads nothing
+  // while still reporting success. HealthKit has no equivalent gate, which is
+  // why iOS background sync worked without this.
+  //
+  // Asked at most once (the permission sheet can't be re-shown usefully after a
+  // decline), and never on iOS. Updates _bgReadsBlocked, which surfaces the
+  // warning under the automatic-upload switch when the grant is missing.
+  Future<void> _ensureBackgroundHealthAccess() async {
+    if (!Platform.isAndroid || !_configured) return;
+    var authorized = false;
+    try {
+      // Older Health Connect builds have no background-read feature at all;
+      // there's nothing to grant and nothing to warn about.
+      if (await _health.isHealthDataInBackgroundAvailable()) {
+        authorized = await _health.isHealthDataInBackgroundAuthorized();
+        if (!authorized) {
+          final prefs = await SharedPreferences.getInstance();
+          if (!(prefs.getBool(_bgHealthAskedPrefsKey) ?? false)) {
+            await prefs.setBool(_bgHealthAskedPrefsKey, true);
+            authorized = await _health
+                .requestHealthDataInBackgroundAuthorization();
+          }
+        }
+      } else {
+        authorized = true;
+      }
+    } catch (e) {
+      debugPrint('[bg-health] background read authorization failed: $e');
+    }
+    if (!mounted) return;
+    setState(() => _bgReadsBlocked = !authorized);
   }
 
   // Marks the route-access onboarding step complete (granted or skipped).
@@ -2320,13 +2376,35 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           const SizedBox(height: 16),
           Card(
-            child: SwitchListTile(
-              title: const Text('Upload automatically'),
-              subtitle: const Text(
-                'Sync in the background and when the app opens',
-              ),
-              value: _autoSyncEnabled ?? false,
-              onChanged: _uploading ? null : (v) => _setAutoSync(v),
+            child: Column(
+              children: [
+                SwitchListTile(
+                  title: const Text('Upload automatically'),
+                  subtitle: const Text(
+                    'Sync in the background and when the app opens',
+                  ),
+                  value: _autoSyncEnabled ?? false,
+                  onChanged: _uploading ? null : (v) => _setAutoSync(v),
+                ),
+                // Automatic upload is on but Health Connect won't serve reads
+                // outside the foreground, so the scheduled syncs upload
+                // nothing. Only the user can fix it, and only in Health
+                // Connect's own settings — so say where.
+                if (_bgReadsBlocked && _autoSyncEnabled == true)
+                  ListTile(
+                    leading: Icon(
+                      Icons.warning_amber,
+                      color: theme.colorScheme.error,
+                    ),
+                    title: const Text('Background access is off'),
+                    subtitle: const Text(
+                      'Health Connect only returns data while the app is open, '
+                      'so background syncs upload nothing. Turn on "Access '
+                      'data in the background" in Health Connect → App '
+                      'permissions → Chadwick XC Training.',
+                    ),
+                  ),
+              ],
             ),
           ),
           ..._coachSettingsCard(theme),
