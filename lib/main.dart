@@ -21,6 +21,7 @@ import 'background_sync.dart'
         scheduleAndroidSync,
         workManagerCallbackDispatcher;
 import 'coach_mail.dart';
+import 'schedule_service.dart';
 import 'sync_service.dart';
 import 'training_week.dart';
 
@@ -30,6 +31,15 @@ import 'training_week.dart';
 // disables Google Sign-In; dev-login still works.
 const String _googleServerClientId = String.fromEnvironment(
   'GOOGLE_SERVER_CLIENT_ID',
+  defaultValue: '',
+);
+
+// Google Calendar iCal feed for the team schedule (practices + meets). Set via
+// --dart-define-from-file=config/dev.json — see CLAUDE.md "Team schedule".
+// Empty hides the schedule card entirely, so the app is fully usable without
+// it.
+const String _scheduleIcsUrl = String.fromEnvironment(
+  'SCHEDULE_ICS_URL',
   defaultValue: '',
 );
 
@@ -51,6 +61,10 @@ const double _metersPerMile = 1609.344;
 // entrypoint, imported from background_sync.dart); absence = not asked yet,
 // which keeps the user in onboarding.
 const String _routeAccessDonePrefsKey = 'route_access_done';
+
+// shared_preferences key — Schedule tab: hide practices and meets once
+// they're fully past. Defaults to on; absent means the user hasn't changed it.
+const String _hidePastEventsPrefsKey = 'hide_past_events';
 
 // shared_preferences key — iOS only: the health permission sheet has been
 // shown and accepted. HealthKit never discloses READ-grant status (the
@@ -562,7 +576,17 @@ class _HomeScreenState extends State<HomeScreen> {
   // Connect, grouped into logical runs. Refreshed when the tab is opened.
   Future<List<_HcRun>>? _hcRunsFuture;
 
-  // Coach-email digest shown at the top of the Training page. Null until the
+  // Team schedule shown on the Home and Schedule tabs. Cached the same way as
+  // _hcRunsFuture so a rebuild doesn't re-fetch the feed on every setState.
+  final ScheduleService _scheduleService = ScheduleService(
+    icsUrl: _scheduleIcsUrl,
+  );
+  Future<ScheduleResult>? _scheduleFuture;
+
+  // Schedule tab: drop events once they're fully past. On by default.
+  bool _hidePastEvents = true;
+
+  // Coach-email digest shown at the top of the Home page. Null until the
   // first fetch (or the cached copy) lands; the card renders nothing at all
   // until the server answers with a digest, so it stays invisible on servers
   // that don't implement the endpoint (see coach_mail.dart).
@@ -627,6 +651,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _autoSyncEnabled = prefs.containsKey(autoSyncPrefsKey)
           ? prefs.getBool(autoSyncPrefsKey)
           : null;
+      _hidePastEvents = prefs.getBool(_hidePastEventsPrefsKey) ?? true;
     });
     await _configureHealth();
     if (!mounted) return;
@@ -1256,41 +1281,17 @@ class _HomeScreenState extends State<HomeScreen> {
     // access, automatic-upload choice).
     if (!_onboarded) return _buildOnboarding(theme);
 
-    // The team doesn't record runs in-app, so release builds are Training +
-    // Runs (workouts other apps wrote to Health Connect) + Settings. The Debug
-    // tools tab exists only in debug builds.
-    final tabs = <({String title, IconData icon, IconData selected})>[
-      (
-        title: 'Training',
-        icon: Icons.insights_outlined,
-        selected: Icons.insights,
-      ),
-      (
-        title: 'Runs',
-        icon: Icons.directions_run_outlined,
-        selected: Icons.directions_run,
-      ),
-      (
-        title: 'Settings',
-        icon: Icons.settings_outlined,
-        selected: Icons.settings,
-      ),
-      if (kDebugMode)
-        (
-          title: 'Debug',
-          icon: Icons.bug_report_outlined,
-          selected: Icons.bug_report,
-        ),
-    ];
-    const settingsIndex = 2;
+    final tabs = _tabs;
     final index = _pageIndex.clamp(0, tabs.length - 1);
+    final settingsIndex = _indexOfTab('settings');
 
     // Build only the active page — building all of them every frame would
     // re-run the Runs loaders on every setState.
-    final Widget body = switch (index) {
-      0 => _buildTrainingPage(theme),
-      1 => _buildHcRunsPage(theme),
-      settingsIndex => _buildSettingsPage(theme),
+    final Widget body = switch (tabs[index].id) {
+      'home' => _buildHomePage(theme),
+      'schedule' => _buildSchedulePage(theme),
+      'runs' => _buildHcRunsPage(theme),
+      'settings' => _buildSettingsPage(theme),
       _ => _buildDebugPage(theme),
     };
 
@@ -1306,7 +1307,13 @@ class _HomeScreenState extends State<HomeScreen> {
         onDestinationSelected: (i) {
           setState(() {
             _pageIndex = i;
-            if (i == 1) _hcRunsFuture = _loadHcRuns(); // refresh on open
+            // Refresh on open, so a tab never shows a stale read.
+            switch (tabs[i].id) {
+              case 'runs':
+                _hcRunsFuture = _loadHcRuns();
+              case 'schedule':
+                _scheduleFuture = _scheduleService.load();
+            }
           });
         },
         destinations: [
@@ -1314,12 +1321,65 @@ class _HomeScreenState extends State<HomeScreen> {
             NavigationDestination(
               icon: Icon(t.icon),
               selectedIcon: Icon(t.selected),
-              label: t.title,
+              label: t.label,
             ),
         ],
       ),
     );
   }
+
+  // The team doesn't record runs in-app, so release builds are Training +
+  // Schedule + Runs (workouts other apps wrote to Health Connect) + Settings.
+  // Schedule is present only when a feed is configured, and Debug only in
+  // debug builds — so positions shift, and callers must resolve indices via
+  // _indexOfTab rather than hardcoding them.
+  // `label` is the bottom-bar caption, `title` the app-bar heading — they
+  // differ only on Home, which is captioned briefly but titled with the full
+  // app name.
+  List<
+    ({String id, String title, String label, IconData icon, IconData selected})
+  >
+  get _tabs => [
+    (
+      id: 'home',
+      title: 'Chadwick XC Training',
+      label: 'Home',
+      icon: Icons.home_outlined,
+      selected: Icons.home,
+    ),
+    if (_scheduleService.isConfigured)
+      (
+        id: 'schedule',
+        title: 'Schedule',
+        label: 'Schedule',
+        icon: Icons.event_outlined,
+        selected: Icons.event,
+      ),
+    (
+      id: 'runs',
+      title: 'Runs',
+      label: 'Runs',
+      icon: Icons.directions_run_outlined,
+      selected: Icons.directions_run,
+    ),
+    (
+      id: 'settings',
+      title: 'Settings',
+      label: 'Settings',
+      icon: Icons.settings_outlined,
+      selected: Icons.settings,
+    ),
+    if (kDebugMode)
+      (
+        id: 'debug',
+        title: 'Debug',
+        label: 'Debug',
+        icon: Icons.bug_report_outlined,
+        selected: Icons.bug_report,
+      ),
+  ];
+
+  int _indexOfTab(String id) => _tabs.indexWhere((t) => t.id == id);
 
   // Signed-out landing: team logo, welcome message, and sign-in — no other
   // buttons, no bottom nav.
@@ -1893,7 +1953,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // Signed-in home: what the athlete has actually run — this week's volume,
   // the four-week trend, and the latest runs. Everything here is computed from
   // Health Connect / HealthKit on the phone, so it works offline.
-  Widget _buildTrainingPage(ThemeData theme) {
+  Widget _buildHomePage(ThemeData theme) {
     return FutureBuilder<List<_HcRun>>(
       future: _hcRunsFuture ??= _loadHcRuns(),
       builder: (context, snap) {
@@ -1914,17 +1974,25 @@ class _HomeScreenState extends State<HomeScreen> {
 
         return RefreshIndicator(
           onRefresh: () async {
-            final future = _loadHcRuns();
-            setState(() => _hcRunsFuture = future);
-            await Future.wait([future, _loadCoachMail()]);
+            // Everything Home shows, including the schedule tile — a pull
+            // that refreshed only some of the page would be a trap.
+            final runs = _loadHcRuns();
+            final schedule = _scheduleService.load();
+            setState(() {
+              _hcRunsFuture = runs;
+              _scheduleFuture = schedule;
+            });
+            await Future.wait([runs, schedule, _loadCoachMail()]);
           },
           child: ListView(
             padding: const EdgeInsets.all(16),
             children: [
-              // Coach mail sits above the training numbers: it's the only
-              // time-sensitive thing on this page (practice moved, meet
-              // logistics), and it self-hides when unconfigured.
+              // The two time-sensitive things lead the page, in the order they
+              // matter: what the coach just said (practice moved, meet
+              // logistics), then what's actually on this week. Training
+              // numbers follow. Both self-hide when unconfigured.
               ..._coachCard(theme),
+              if (_scheduleService.isConfigured) _buildHomeScheduleTile(theme),
               Card(
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
@@ -2014,7 +2082,8 @@ class _HomeScreenState extends State<HomeScreen> {
                   Align(
                     alignment: Alignment.centerLeft,
                     child: TextButton(
-                      onPressed: () => setState(() => _pageIndex = 1),
+                      onPressed: () =>
+                          setState(() => _pageIndex = _indexOfTab('runs')),
                       child: Text('See all ${runs.length} activities'),
                     ),
                   ),
@@ -2026,9 +2095,314 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Future<void> _setHidePastEvents(bool enabled) async {
+    setState(() => _hidePastEvents = enabled);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_hidePastEventsPrefsKey, enabled);
+  }
+
+  // Grouped weeks as the user has chosen to see them. Shared by Home and the
+  // Schedule tab so the two can't disagree about what's still upcoming.
+  List<ScheduleWeek> _visibleWeeks(ScheduleResult result) {
+    final weeks = groupByWeek(result.events);
+    return _hidePastEvents ? dropPastEntries(weeks, DateTime.now()) : weeks;
+  }
+
+  // The Schedule tab's first week card, mirrored onto Home as a shortcut into
+  // that tab. Headed "Schedule" rather than by its week, because Home already
+  // has a "This week" card for mileage and two identical headings would be a
+  // coin flip to read.
+  Widget _buildHomeScheduleTile(ThemeData theme) {
+    return FutureBuilder<ScheduleResult>(
+      future: _scheduleFuture ??= _scheduleService.load(),
+      builder: (context, snap) {
+        final result = snap.data;
+        final weeks =
+            snap.connectionState == ConnectionState.done && result != null
+            ? _visibleWeeks(result)
+            : const <ScheduleWeek>[];
+        // Home is a glance surface: a spinner or an error card here would
+        // push the mileage chart around for no gain. The Schedule tab
+        // reports both properly.
+        if (weeks.isEmpty) return const SizedBox.shrink();
+
+        final week = weeks.first;
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: Card(
+            // Without this the ink ripple paints over the rounded corners.
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
+              onTap: () => setState(() {
+                _pageIndex = _indexOfTab('schedule');
+                _scheduleFuture = _scheduleService.load();
+              }),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Schedule',
+                                style: theme.textTheme.titleMedium?.copyWith(
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              Text(
+                                _fmtWeekHeader(week.weekStart, DateTime.now()),
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Icon(
+                          Icons.chevron_right,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    for (final e in week.entries)
+                      _scheduleEntryTile(theme, e, detailMaxLines: 2),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  // Schedule tab: every practice and meet in the lookahead window, one card
+  // per week, with repeats inside a week collapsed onto a single row. Only
+  // built when SCHEDULE_ICS_URL is set.
+  Widget _buildSchedulePage(ThemeData theme) {
+    return RefreshIndicator(
+      onRefresh: () async {
+        final future = _scheduleService.load();
+        setState(() => _scheduleFuture = future);
+        await future;
+      },
+      child: FutureBuilder<ScheduleResult>(
+        future: _scheduleFuture ??= _scheduleService.load(),
+        builder: (context, snap) {
+          if (snap.connectionState != ConnectionState.done) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          final result =
+              snap.data ??
+              ScheduleResult(events: const [], error: '${snap.error}');
+          final now = DateTime.now();
+          final weeks = _visibleWeeks(result);
+
+          return ListView(
+            padding: const EdgeInsets.all(16),
+            // Keep the pull-to-refresh gesture alive even when the list is
+            // too short to scroll.
+            physics: const AlwaysScrollableScrollPhysics(),
+            children: [
+              // Stale data is still useful, but say so rather than passing it
+              // off as a live read.
+              if (result.fromCache && weeks.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.cloud_off_outlined,
+                        size: 16,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          "Saved copy — couldn't reach the calendar"
+                          '${result.fetchedAt != null ? ', last updated ${_fmtScheduleDay(result.fetchedAt!, now)}' : ''}.',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              if (weeks.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Text(
+                    // An error with no cached copy is the only way to get
+                    // here with something worth explaining.
+                    result.error ??
+                        'No practices or meets scheduled in the next '
+                            '${ScheduleService.lookahead.inDays} days.',
+                    textAlign: TextAlign.center,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                )
+              else
+                for (final w in weeks) _scheduleWeekCard(theme, w, now),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _scheduleWeekCard(ThemeData theme, ScheduleWeek week, DateTime now) {
+    return Card(
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              _fmtWeekHeader(week.weekStart, now),
+              style: theme.textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 4),
+            for (final e in week.entries) _scheduleEntryTile(theme, e),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // [detailMaxLines] clamps the time/location line. Home passes 2 so a
+  // full street address can't stretch the tile; the Schedule tab leaves it
+  // null so the address is readable in full somewhere.
+  Widget _scheduleEntryTile(
+    ThemeData theme,
+    ScheduleEntry e, {
+    int? detailMaxLines,
+  }) {
+    final detail = [
+      // An all-day event's start is midnight, which would read "12:00 AM".
+      if (e.isAllDay) 'All day' else _fmtClock(e.first),
+      if (e.location != null && e.location!.isNotEmpty) e.location!,
+    ].join('  ·  ');
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 88,
+            child: Text(
+              compactDayLabel(e.starts),
+              style: theme.textTheme.bodyMedium?.copyWith(
+                fontWeight: FontWeight.w600,
+                color: theme.colorScheme.primary,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(e.summary, style: theme.textTheme.bodyMedium),
+                Text(
+                  detail,
+                  maxLines: detailMaxLines,
+                  overflow: detailMaxLines == null
+                      ? null
+                      : TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // "This week" / "Next week" / "Week of Aug 24". Compared in UTC so a DST
+  // boundary inside the span can't turn 7 days into 6.
+  String _fmtWeekHeader(DateTime weekStart, DateTime now) {
+    final thisMonday = DateTime.utc(
+      now.year,
+      now.month,
+      now.day - (now.weekday - 1),
+    );
+    final that = DateTime.utc(weekStart.year, weekStart.month, weekStart.day);
+    switch (that.difference(thisMonday).inDays) {
+      case 0:
+        return 'This week';
+      case 7:
+        return 'Next week';
+    }
+
+    const months = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
+    return 'Week of ${months[weekStart.month - 1]} ${weekStart.day}';
+  }
+
+  // "Today" / "Tomorrow" / "Sat Sep 12" — schedule times are already local,
+  // unlike the Health Connect timestamps _fmtRunDate handles.
+  String _fmtScheduleDay(DateTime d, DateTime now) {
+    final day = DateTime(d.year, d.month, d.day);
+    final today = DateTime(now.year, now.month, now.day);
+    final diff = day.difference(today).inDays;
+    if (diff == 0) return 'Today';
+    if (diff == 1) return 'Tomorrow';
+
+    const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    const months = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
+    return '${days[d.weekday - 1]} ${months[d.month - 1]} ${d.day}';
+  }
+
+  String _fmtClock(DateTime d) {
+    final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+    final ampm = d.hour < 12 ? 'AM' : 'PM';
+    return '$h:${d.minute.toString().padLeft(2, '0')} $ampm';
+  }
+
   // "From your coach" — the server's digest of recently forwarded coach email.
-  // Returns an empty list (so the Training page looks exactly as it did
-  // before) until the server actually answers with one: a server that doesn't
+  // Returns an empty list (so the Home page looks exactly as it did before)
+  // until the server actually answers with one: a server that doesn't
   // implement /coach-digest yields notConfigured and no card ever appears.
   List<Widget> _coachCard(ThemeData theme) {
     final result = _coachResult;
@@ -2329,6 +2703,20 @@ class _HomeScreenState extends State<HomeScreen> {
               onChanged: _uploading ? null : (v) => _setAutoSync(v),
             ),
           ),
+          if (_scheduleService.isConfigured) ...[
+            const SizedBox(height: 16),
+            Card(
+              child: SwitchListTile(
+                title: const Text('Hide past events'),
+                subtitle: const Text(
+                  'Remove practices and meets from the schedule once every '
+                  'day of the event has passed',
+                ),
+                value: _hidePastEvents,
+                onChanged: _setHidePastEvents,
+              ),
+            ),
+          ],
           ..._coachSettingsCard(theme),
           if (!_uploading) ...[
             const SizedBox(height: 16),
