@@ -707,6 +707,142 @@ requiring `DEV_MODE=true`) in production.
 
 ---
 
+## Coach email digest
+
+**Status: not implemented server-side.** The app ships the client for this today; until the endpoints exist the card is invisible (see "Absence is the off switch" below), so deploying the server half is the only step needed to light it up.
+
+The athlete forwards coach email to a mailbox the server owns. The server polls it, summarizes what it finds with an LLM, and serves the result per-athlete. The app only renders — it never touches the mailbox or a model API. That's deliberate: it keeps the mailbox credentials and the model key on the server instead of inside a binary anyone can unzip, and summarizes each email once for the team rather than once per device.
+
+### Endpoints
+
+| | |
+|---|---|
+| `GET <base>/coach-digest` | The athlete's current cached digest. Cheap and side-effect-free — the app calls it on every open and on pull-to-refresh. Must **not** poll the mailbox. |
+| `POST <base>/coach-digest/refresh` | Poll the mailbox now, re-summarize, and return the fresh result. Backs Settings → "Re-summarize". Same response shape. |
+| Auth | **Required.** `Authorization: Bearer <server JWT>`; the digest is scoped to the token's athlete. |
+| Timeout (client) | 20s for `GET`, 90s for the refresh `POST`. |
+
+### Response — both endpoints
+
+```jsonc
+{
+  "digest": {
+    "headline": "Saturday's meet moved to 9am — bus leaves school at 7:15",
+    "bullets": [
+      "Tuesday: 6×800m at the track, 5pm",
+      "Wednesday: easy 4 miles on your own",
+      "Bring both racing flats and trainers Saturday"
+    ],
+    "actions": ["Turn in the travel permission form by Thursday"],
+    "generated_at": "2026-08-10T13:00:00Z",   // when the SERVER summarized
+    "source_count": 3
+  },
+  "messages": [                                // the emails behind the digest
+    {
+      "id": "<CAF=abc123@mail.gmail.com>",     // stable; the RFC Message-ID
+      "from": "coach@school.edu",
+      "from_name": "Coach Kim",
+      "subject": "Saturday meet — time change",
+      "date": "2026-08-09T18:00:00Z",
+      "body": "Plain text. HTML-only mail should be flattened server-side."
+    }
+  ]
+}
+```
+
+Field notes:
+
+- **`digest` may be `null`**, and `messages` may be `[]` — that's the "nothing to show yet" state (no mail linked, or nothing in the window). The app renders "No coach email yet." rather than an error.
+- **A digest whose `headline`, `bullets`, and `actions` are all empty is treated as `null`** by the client, so don't bother synthesizing an empty summary.
+- **`bullets` / `actions` may be omitted or `null`**; the client coerces to `[]` and drops blank entries.
+- **`generated_at`** is when the *server* produced the summary, not when the app fetched it — the card shows "Summarized 3h ago" from it. ISO-8601, UTC.
+- **`body`** should be plain text. Flatten HTML server-side; the client renders it verbatim in a monospace-free `SelectableText` and does no sanitizing.
+- Send UTF-8 with `Content-Type: application/json; charset=utf-8`.
+
+### Absence is the off switch
+
+**`404` or `501` means "this server doesn't do digests"** — the client marks the feature unavailable, hides the card completely, and stops calling for the rest of the session. So a server that hasn't implemented this needs to do nothing at all; the existing 404 already does the right thing. Don't return `200` with an empty digest to mean "not supported" — that renders an empty card instead of no card.
+
+Other statuses:
+
+- `401` → the client drops the token and sends the athlete back to sign-in, same as every other endpoint.
+- Any other `4xx`/`5xx` → shown on the card as an error *underneath* the last cached digest, which the app keeps locally. A flaky server degrades the card rather than blanking it.
+
+### Server-side implementation notes
+
+Things worth getting right, learned from prototyping this in the app before moving it:
+
+- **Fetch with `BODY.PEEK[]`, never `BODY[]`.** `BODY[]` sets the `\Seen` flag, which would silently mark the coach's mail read in a mailbox the athlete may also read by hand.
+- **The IMAP `SINCE` criterion is `dd-MMM-yyyy` with English month abbreviations** (`SINCE 05-Aug-2026`). Build it by hand — a locale-aware date formatter emits localized month names and the search fails.
+- **Key the "has anything changed?" check on the `Message-ID` header, not the IMAP sequence number.** Sequence numbers shift as mail arrives, so using them re-summarizes (and re-bills) on every poll. Re-summarize only when the *set* of Message-IDs in the window changes; `POST /coach-digest/refresh` should bypass that check.
+- **Gmail needs an App Password and IMAP enabled** on the mailbox; the account password is rejected. `AUTHENTICATIONFAILED` is almost always one of those two.
+- **Auto-forwarding preserves the original `From:`; the "Forward" button does not** — a hand-forwarded message arrives from the athlete with the real sender only in the quoted `---------- Forwarded message ----------` header. If you filter by sender, match the header first and fall back to scanning the first ~600 characters of the body.
+- A 14-day window, 25 messages, and ~4000 characters per body was a sensible starting budget.
+
+### Suggested summarization prompt
+
+Ask for strict JSON so the endpoint can hand it straight back:
+
+```
+You summarize emails a high school cross country coach sent to a runner, for a
+card on the home screen of the runner's training app.
+
+Reply with ONLY a JSON object, no markdown fence and no commentary:
+{"headline": string, "bullets": [string], "actions": [string]}
+
+- "headline": one sentence, at most 100 characters, naming the single most
+  important or most time-sensitive thing across all the emails.
+- "bullets": 2-5 short factual points — practice times and locations, meet
+  details, workout assignments, schedule changes. Keep each under 120
+  characters. Put concrete dates and times in, and prefer the newest email
+  when two emails disagree.
+- "actions": anything the runner personally has to do (forms, gear, replies,
+  arrival times), each with its deadline if one was given. Empty list if the
+  emails ask nothing of the runner.
+
+Be concrete and never invent a detail that is not in the emails. If the emails
+carry no useful information, return an empty headline and empty lists.
+```
+
+Give the model today's date, then each email as `From` / `Date` / `Subject` / body, newest first. Parse defensively — strip a ```json fence and take the outermost `{`…`}` before decoding.
+
+### Storage (Postgres)
+
+```sql
+CREATE TABLE coach_mailbox (            -- one row per athlete who linked mail
+  athlete_id      INTEGER PRIMARY KEY REFERENCES athletes(id),
+  imap_host       TEXT NOT NULL,
+  imap_username   TEXT NOT NULL,
+  imap_password   TEXT NOT NULL,        -- encrypt at rest; never leaves the server
+  sender_filter   TEXT,                 -- comma-separated; NULL = all mail
+  last_polled_at  TIMESTAMPTZ
+);
+
+CREATE TABLE coach_message (
+  athlete_id  INTEGER NOT NULL REFERENCES athletes(id),
+  message_id  TEXT    NOT NULL,         -- RFC Message-ID
+  sender      TEXT,
+  sender_name TEXT,
+  subject     TEXT,
+  sent_at     TIMESTAMPTZ,
+  body        TEXT,
+  PRIMARY KEY (athlete_id, message_id)
+);
+
+CREATE TABLE coach_digest (
+  athlete_id   INTEGER PRIMARY KEY REFERENCES athletes(id),
+  headline     TEXT,
+  bullets      JSONB NOT NULL DEFAULT '[]',
+  actions      JSONB NOT NULL DEFAULT '[]',
+  generated_at TIMESTAMPTZ NOT NULL,
+  source_ids   JSONB NOT NULL DEFAULT '[]'  -- Message-IDs; the change check
+);
+```
+
+`source_ids` is what makes the skip-if-unchanged check cheap: compare the sorted Message-IDs in the window against the stored set and only call the model when they differ.
+
+---
+
 ## Future work
 
 - **Background sync** via WorkManager (no need to open the app).
