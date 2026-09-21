@@ -211,6 +211,7 @@ class _RouteMapView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final path = smoothPath(points);
     return FlutterMap(
       options: MapOptions(
         initialCenter: points.first,
@@ -230,9 +231,15 @@ class _RouteMapView extends StatelessWidget {
         PolylineLayer(
           polylines: [
             Polyline(
-              points: smoothPath(points),
+              points: path,
               strokeWidth: 5,
               color: theme.colorScheme.primary,
+              // A white casing lifts the line off the map — over dark
+              // parkland or grey asphalt the bare stroke loses its edges,
+              // and an out-and-back that doubles over itself becomes
+              // impossible to follow.
+              borderStrokeWidth: 2,
+              borderColor: Colors.white,
             ),
           ],
         ),
@@ -240,21 +247,51 @@ class _RouteMapView extends StatelessWidget {
           markers: [
             Marker(
               point: points.first,
-              width: 16,
-              height: 16,
-              child: _dot(Colors.green),
+              width: 84,
+              height: 56,
+              child: _endpoint(Colors.green.shade700, 'Start'),
             ),
             Marker(
               point: points.last,
-              width: 16,
-              height: 16,
-              child: _dot(Colors.red),
+              width: 84,
+              height: 56,
+              child: _endpoint(Colors.red.shade700, 'Finish'),
             ),
           ],
         ),
       ],
     );
   }
+
+  // Dot on the coordinate with its label floating above. The marker's centre
+  // is the coordinate, so the dot is centred and the label takes the space
+  // above it — keeping the dot exactly on the point rather than beside it.
+  static Widget _endpoint(Color color, String label) => Stack(
+    children: [
+      Align(
+        alignment: Alignment.topCenter,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+          decoration: BoxDecoration(
+            color: color,
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      ),
+      Align(
+        alignment: Alignment.center,
+        child: SizedBox(width: 16, height: 16, child: _dot(color)),
+      ),
+    ],
+  );
 
   static Widget _dot(Color c) => Container(
     decoration: BoxDecoration(
@@ -321,9 +358,13 @@ class _HcRunDetailPage extends StatelessWidget {
             ),
           Padding(
             padding: const EdgeInsets.all(16),
+            // Cards are a fixed width and there are 3–7 of them depending on
+            // what the workout recorded, so rows are usually partial. Centred
+            // rather than left-aligned, which left a ragged gap down the right.
             child: Wrap(
               spacing: 12,
               runSpacing: 12,
+              alignment: WrapAlignment.center,
               children: [for (final s in stats) _statCard(theme, s)],
             ),
           ),
@@ -1724,18 +1765,54 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           );
         }
-        return ListView.separated(
-          itemCount: runs.length,
-          separatorBuilder: (_, _) => const Divider(height: 1),
-          itemBuilder: (context, i) => _runTile(runs[i]),
+        // Bucket into Monday–Sunday weeks through the same startOfWeek the
+        // mileage chart uses, so a run can't file under one week here and
+        // count toward a different one there. _loadHcRuns returns newest
+        // first, and insertion order keeps that inside each week.
+        final byWeek = <DateTime, List<_HcRun>>{};
+        for (final r in runs) {
+          byWeek.putIfAbsent(startOfWeek(r.start), () => []).add(r);
+        }
+        final weekStarts = byWeek.keys.toList()..sort((a, b) => b.compareTo(a));
+        final now = DateTime.now();
+
+        return ListView(
+          children: [
+            for (final w in weekStarts)
+              ..._runsWeekSection(theme, _fmtWeekHeader(w, now), byWeek[w]!),
+            const SizedBox(height: 12),
+          ],
         );
       },
     );
   }
 
-  // One run in a list — shared by the Runs tab and the Training tab's recent
+  // One week's block on the Runs tab: its header, then that week's runs.
+  List<Widget> _runsWeekSection(
+    ThemeData theme,
+    String label,
+    List<_HcRun> runs,
+  ) => [
+    Padding(
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 6),
+      child: Text(
+        label,
+        style: theme.textTheme.titleSmall?.copyWith(
+          fontWeight: FontWeight.w600,
+          color: theme.colorScheme.primary,
+        ),
+      ),
+    ),
+    for (var i = 0; i < runs.length; i++) ...[
+      _runTile(runs[i]),
+      if (i < runs.length - 1) const Divider(height: 1),
+    ],
+  ];
+
+  // One run in a list — shared by the Runs tab and the Home tab's recent
   // runs. Tapping opens the detail page.
   Widget _runTile(_HcRun r) {
+    final date = _runTileDateParts(r.start);
     final miles = r.miles;
     final parts = <String>[
       if (miles != null) '${miles.toStringAsFixed(2)} mi',
@@ -1753,8 +1830,18 @@ class _HomeScreenState extends State<HomeScreen> {
             ? theme.colorScheme.primary
             : theme.colorScheme.onSurfaceVariant,
       ),
-      title: Text(
-        '${_prettyActivity(r.activityType)} · ${_fmtRunDate(r.start.toUtc())}',
+      title: Text.rich(
+        TextSpan(
+          children: [
+            TextSpan(
+              text: date.day,
+              style: const TextStyle(fontWeight: FontWeight.w700),
+            ),
+            TextSpan(
+              text: ' · ${_prettyActivity(r.activityType)} · ${date.rest}',
+            ),
+          ],
+        ),
       ),
       subtitle: Text(parts.join(' · ')),
       trailing: const Icon(Icons.chevron_right),
@@ -1887,6 +1974,35 @@ class _HomeScreenState extends State<HomeScreen> {
     final ampm = d.hour < 12 ? 'AM' : 'PM';
     final min = d.minute.toString().padLeft(2, '0');
     return '${months[d.month - 1]} ${d.day}, ${d.year}  $h:$min $ampm';
+  }
+
+  // Split rather than formatted whole, so the weekday can be bolded on its
+  // own: it leads the row and is what you scan for in a week-grouped list.
+  // No year — the week header above already places it.
+  ({String day, String rest}) _runTileDateParts(DateTime when) {
+    final d = when.toLocal();
+    const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    const months = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
+    final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+    final ampm = d.hour < 12 ? 'AM' : 'PM';
+    final min = d.minute.toString().padLeft(2, '0');
+    return (
+      day: days[d.weekday - 1],
+      rest: '${months[d.month - 1]} ${d.day}  $h:$min $ampm',
+    );
   }
 
   // Upload state, rendered both as the app-bar chip and on the Settings tab.
@@ -2348,6 +2464,8 @@ class _HomeScreenState extends State<HomeScreen> {
         return 'This week';
       case 7:
         return 'Next week';
+      case -7:
+        return 'Last week';
     }
 
     const months = [
